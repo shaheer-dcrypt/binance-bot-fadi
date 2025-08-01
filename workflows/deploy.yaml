@@ -1,0 +1,25 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        env:
+          PRIVATE_KEY: ${{ secrets.EC2_PRIVATE_KEY }}
+          HOST: ${{ secrets.EC2_HOST }}
+          USER: ${{ secrets.EC2_USER }}
+        run: |
+          echo "$PRIVATE_KEY" > key.pem && chmod 600 key.pem
+          ssh -o StrictHostKeyChecking=no -i key.pem ${USER}@${HOST} '
+            cd /home/ubuntu/mybot &&
+            git pull origin main &&
+            pip install -r requirements.txt &&
+            sudo systemctl restart mybot.service
+          '

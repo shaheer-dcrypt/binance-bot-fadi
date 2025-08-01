@@ -1,0 +1,5 @@
+numpy
+boto3
+gspread
+oauth2client
+python-binance
