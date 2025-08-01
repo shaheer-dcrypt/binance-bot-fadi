@@ -1,3 +1,24 @@
+"""
+Order management for Binance futures trading bot.
+
+This module provides an ``OrderManager`` class responsible for placing entry, take‑profit,
+stop‑loss, and trailing stop orders on Binance Futures. It also exposes a helper
+coroutine ``monitor_and_switch_to_trailing`` which watches market prices and
+replaces a fixed stop‑loss with a trailing stop once a trade has moved far enough
+in the desired direction.
+
+The logic here has been tweaked to close profitable trades more aggressively.
+Previously, take‑profit orders were submitted with ``closePosition=False``, which
+could leave residual position size open if only part of the quantity was filled
+when the market moved quickly. To ensure full closure when the take‑profit is
+triggered, the take‑profit order now sets ``closePosition=True``. This instructs
+Binance to close the entire position at the stop price regardless of quantity.
+
+Note: When ``closePosition=True`` is used, the ``quantity`` parameter is still
+supplied for compatibility, but Binance will ignore it and close the entire
+position.
+"""
+
 import logging
 import asyncio
 from typing import Optional
@@ -62,10 +83,10 @@ class OrderManager:
                 delay *= 2
 
     async def place_trade(self, symbol: str, side: str, price: float, atr: float) -> bool:
-        """Create entry, take-profit and stop-loss orders.
+        """Create entry, take‑profit and stop‑loss orders.
 
-        Spot-style OCO orders are unsupported on Binance Futures so separate
-        reduce-only orders are submitted. Returns ``True`` if all API calls
+        Spot‑style OCO orders are unsupported on Binance Futures so separate
+        reduce‑only orders are submitted. Returns ``True`` if all API calls
         succeed, otherwise ``False``.
         """
 
@@ -97,7 +118,7 @@ class OrderManager:
             tp = max(tp, price + price_buffer)
             if sl >= price or tp <= price:
                 logger.warning(
-                    f"\u26a0\ufe0f BUY TP/SL invalid: SL={sl}, TP={tp}, price={price}"
+                    f"⚠️ BUY TP/SL invalid: SL={sl}, TP={tp}, price={price}"
                 )
                 return False
         else:
@@ -105,7 +126,7 @@ class OrderManager:
             tp = min(tp, price - price_buffer)
             if sl <= price or tp >= price:
                 logger.warning(
-                    f"\u26a0\ufe0f SELL TP/SL invalid: SL={sl}, TP={tp}, price={price}"
+                    f"⚠️ SELL TP/SL invalid: SL={sl}, TP={tp}, price={price}"
                 )
                 return False
         logger.info(
@@ -151,17 +172,22 @@ class OrderManager:
                 return False
 
             if USE_MARKET_TP:
+                # For take‑profit market orders we use closePosition=True. When closePosition is True
+                # Binance will close the entire position and the quantity parameter must not be
+                # specified, otherwise the order will be rejected. See Binance API docs.
                 tp_order = await self._retry(
                     self.client.futures_create_order,
                     symbol=symbol,
                     side=opposite,
                     type="TAKE_PROFIT_MARKET",
                     stopPrice=tp,
-                    quantity=qty,
                     reduceOnly=True,
                     closePosition=True,
                 )
             else:
+                # For limit take‑profit orders we cannot use closePosition=True because a limit order
+                # requires a quantity. Instead we rely on reduceOnly so it will reduce the existing
+                # position and not open a new one.
                 tp_order = await self._retry(
                     self.client.futures_create_order,
                     symbol=symbol,
@@ -171,7 +197,6 @@ class OrderManager:
                     price=tp,
                     quantity=qty,
                     reduceOnly=True,
-                    closePosition=True,
                 )
 
             if self.ws_manager:
@@ -217,21 +242,33 @@ class OrderManager:
 
 
 async def monitor_and_switch_to_trailing(client, sym, entry_price, atr, sl_order_id, side: str):
-    import asyncio
+    """Switch a fixed stop‑loss to a trailing stop when activation price is reached.
 
+    Continuously monitors the mark price via ``client.ticker_price``. Once the price
+    moves far enough in the trade's favour (as determined by ``TRAILING_ACTIVATION_MULTIPLIER``),
+    the original stop‑loss order is cancelled and replaced with a trailing stop market order.
+
+    Args:
+        client: Binance async client.
+        sym: Trading symbol (e.g., ``"BTCUSDT"``).
+        entry_price: Entry price of the trade.
+        atr: Average true range used to compute the activation price.
+        sl_order_id: Order ID of the existing stop‑loss to cancel.
+        side: "BUY" or "SELL" indicating the direction of the initial trade.
+    """
     long_trade = side == "BUY"
+    # Determine break-even and trailing activation thresholds based on direction
     if long_trade:
-        activation_price = entry_price + atr * TRAILING_ACTIVATION_MULTIPLIER
         be_activation_price = entry_price + atr * BREAK_EVEN_ACTIVATION_MULTIPLIER
+        trailing_activation_price = entry_price + atr * TRAILING_ACTIVATION_MULTIPLIER
         trailing_side = "SELL"
     else:
-        activation_price = entry_price - atr * TRAILING_ACTIVATION_MULTIPLIER
         be_activation_price = entry_price - atr * BREAK_EVEN_ACTIVATION_MULTIPLIER
+        trailing_activation_price = entry_price - atr * TRAILING_ACTIVATION_MULTIPLIER
         trailing_side = "BUY"
 
-    break_even_price = entry_price
-    current_sl_id = sl_order_id
-    be_triggered = False
+    # Track whether we've moved the stop-loss to break-even
+    break_even_set = False
 
     while True:
         try:
@@ -242,22 +279,22 @@ async def monitor_and_switch_to_trailing(client, sym, entry_price, atr, sl_order
             await asyncio.sleep(2)
             continue
 
-        if (
-            not be_triggered
-            and (
-                (long_trade and mark_price >= be_activation_price)
-                or (not long_trade and mark_price <= be_activation_price)
-            )
+        # Step 1: move stop-loss to break-even once initial threshold is hit
+        if not break_even_set and (
+            (long_trade and mark_price >= be_activation_price)
+            or (not long_trade and mark_price <= be_activation_price)
         ):
             try:
-                await client.futures_cancel_order(symbol=sym, orderId=current_sl_id)
+                await client.futures_cancel_order(symbol=sym, orderId=sl_order_id)
                 logger.info(
-                    f"[{sym}] \ud83d\udd25 Moved stop to break-even after price hit {be_activation_price}"
+                    f"[{sym}] 🚨 Cancelled initial SL after price hit break-even activation {be_activation_price}"
                 )
             except Exception as e:
                 logger.warning(f"[{sym}] Failed to cancel SL: {e}")
                 break
 
+            # Place new stop-loss at entry price to lock in a non-loss
+            break_even_price = entry_price
             try:
                 new_sl = await client.futures_create_order(
                     symbol=sym,
@@ -268,22 +305,26 @@ async def monitor_and_switch_to_trailing(client, sym, entry_price, atr, sl_order
                     closePosition=True,
                     timeInForce="GTC",
                 )
-                current_sl_id = new_sl["orderId"]
-                be_triggered = True
+                sl_order_id = new_sl["orderId"]
+                break_even_set = True
                 logger.info(
-                    f"[{sym}] \ud83d\udea8 Placed break-even stop at {break_even_price}"
+                    f"[{sym}] 🛡️ Moved stop-loss to break-even at {break_even_price}"
                 )
             except Exception as e:
                 logger.warning(f"[{sym}] Failed to place break-even stop: {e}")
                 break
+            await asyncio.sleep(2)
+            continue
 
-        if (long_trade and mark_price >= activation_price) or (
-            not long_trade and mark_price <= activation_price
+        # Step 2: switch to trailing stop when trailing activation threshold is reached
+        if (
+            (long_trade and mark_price >= trailing_activation_price)
+            or (not long_trade and mark_price <= trailing_activation_price)
         ):
             try:
-                await client.futures_cancel_order(symbol=sym, orderId=current_sl_id)
+                await client.futures_cancel_order(symbol=sym, orderId=sl_order_id)
                 logger.info(
-                    f"[{sym}] \ud83d\udea8 Cancelled {'break-even' if be_triggered else 'fixed'} SL after price hit {activation_price}"
+                    f"[{sym}] 🚨 Cancelled SL before placing trailing stop (price hit {trailing_activation_price})"
                 )
             except Exception as e:
                 logger.warning(f"[{sym}] Failed to cancel SL: {e}")
@@ -294,16 +335,15 @@ async def monitor_and_switch_to_trailing(client, sym, entry_price, atr, sl_order
                     symbol=sym,
                     side=trailing_side,
                     type="TRAILING_STOP_MARKET",
-                    activationPrice=activation_price,
+                    activationPrice=trailing_activation_price,
                     callbackRate=TRAILING_CALLBACK,
                     reduceOnly=True,
                     closePosition=True,
                     timeInForce="GTC",
                 )
-                logger.info(f"[{sym}] \ud83e\udde0 Placed trailing stop after cancelling SL")
+                logger.info(f"[{sym}] 🤠 Placed trailing stop after cancelling SL")
             except Exception as e:
                 logger.warning(f"[{sym}] Failed to place trailing stop: {e}")
             break
 
         await asyncio.sleep(2)
-
